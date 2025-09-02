@@ -1,0 +1,12 @@
+# Core Bot & Web
+python-telegram-bot==20.7
+requests==2.31.0
+beautifulsoup4==4.12.2
+python-dotenv==1.0.0
+
+# Database
+SQLAlchemy==2.0.22
+psycopg2-binary==2.9.7
+thefuzz
+pymorphy2
+python-Levenshtein==0.25.1
