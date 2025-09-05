@@ -116,4 +116,3 @@ Apache License 2.0 — см. LICENSE
 Boxberry за предоставление API и данных
 Сообщество aiogram за асинхронный фреймворк
 SQLAlchemy за надежную ORM
-
