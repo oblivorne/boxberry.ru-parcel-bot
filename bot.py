@@ -1,15 +1,32 @@
+import asyncio
+import json
 import logging
 import os
-import json
 import re
-import asyncio
-from typing import Optional, Dict, List, Tuple, Any
-from functools import wraps, lru_cache
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import wraps
+from typing import Optional, Dict, List, Tuple, Any
 import aiohttp
+import pymorphy2
+import redis.asyncio as redis
 import xml.etree.ElementTree as ET
+from aiolimiter import AsyncLimiter
 from dotenv import load_dotenv
+from sqlalchemy import (
+    Column,
+    BigInteger,
+    String,
+    Text,
+    DateTime,
+    ForeignKey,
+    func,
+    update as sa_update,
+)
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base, relationship, selectinload
+from sqlalchemy.sql import select, and_
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -25,21 +42,21 @@ from telegram.ext import (
     ConversationHandler,
     CallbackQueryHandler,
 )
-from db import SessionLocal, init_db, User, Parcel
-from sqlalchemy.exc import IntegrityError
-from thefuzz import process, fuzz
-import pymorphy2
+from thefuzz import process
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# Загрузка переменных окружения
+# Load environment variables
 load_dotenv()
-
-# Настройка логирования
+# Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format='{"timestamp": "%(asctime)s", "name": "%(name)s", "level": "%(levelname)s", "message": "%(message)s"}',
 )
 logger = logging.getLogger(__name__)
-
-# Состояния для обработчиков разговоров
+# Database setup
+DATABASE_URL = os.getenv("DATABASE_URL")
+Base = declarative_base()
+# Conversation states
 REGISTER_LOGIN, REGISTER_PASSWORD, REGISTER_NAME, REGISTER_SURNAME = range(4)
 LOGIN_LOGIN, LOGIN_PASSWORD = range(4, 6)
 ADD_TRACKING = 6
@@ -49,115 +66,142 @@ CALC_STORAGE, CALC_CITY_SEARCH, CALC_CITY_SELECT, CALC_WEIGHT, CALC_DELIVERY = r
 )
 
 
-# Класс конфигурации
+# Configuration class
 @dataclass
 class Config:
     TELEGRAM_TOKEN: str
     BASE_URL: str = "https://boxberry.ru"
     MAX_RETRIES: int = 3
     REQUEST_TIMEOUT: int = 30
-    MAX_MESSAGE_LENGTH: int = 4000
-    CACHE_TTL: int = 300  # 5 минут
+    MAX_MESSAGE_LENGTH: int = 4096
+    CACHE_TTL: int = 60
 
     @classmethod
     def from_env(cls):
-        return cls(
-            TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN"),
-            BASE_URL=os.getenv("BOT_BASE_URL", "https://boxberry.ru"),
-        )
+        return cls(TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN"))
 
 
 config = Config.from_env()
-
-
-# Шаблон Singleton для управления данными
-class DataManager:
-    _instance = None
-    _keywords = None
-    _restrictions = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    @property
-    @lru_cache(maxsize=1)
-    def keywords(self) -> Dict:
-        if self._keywords is None:
-            try:
-                with open("keywords_mapping.json", "r", encoding="utf-8") as f:
-                    self._keywords = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                logger.error(f"Не удалось загрузить ключевые слова: {e}")
-                self._keywords = {}
-        return self._keywords
-
-    @property
-    @lru_cache(maxsize=1)
-    def restrictions(self) -> Dict:
-        if self._restrictions is None:
-            try:
-                with open("restrictions.json", "r", encoding="utf-8") as f:
-                    self._restrictions = json.load(f)["countries"]
-            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-                logger.error(f"Не удалось загрузить ограничения: {e}")
-                self._restrictions = {}
-        return self._restrictions
-
-
-data_manager = DataManager()
-
-# Морфологический анализатор
-morph = pymorphy2.MorphAnalyzer()
-
-# Шаблон для трек-номеров
 TRACKING_PATTERN = re.compile(r"^[A-Z0-9\-]{8,}$")
 
 
-# Декораторы
-def async_db_session(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        session = SessionLocal()
-        try:
-            result = await func(session, *args, **kwargs)
-            session.commit()
-            return result
-        except Exception as e:
-            logger.error(f"Ошибка базы данных в {func.__name__}: {e}")
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
-    return wrapper
+# Database models
+class User(Base):
+    __tablename__ = "users"
+    telegram_id = Column(BigInteger, primary_key=True, index=True)
+    telegram_username = Column(String, nullable=True)
+    username = Column(String, unique=True, index=True, nullable=True)
+    password = Column(String, nullable=True)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    parcels = relationship("Parcel", back_populates="user")
 
 
-def handle_errors(send_error_message: bool = True):
+class Parcel(Base):
+    __tablename__ = "parcels"
+    id = Column(BigInteger, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    tracking_number = Column(String, nullable=True)
+    nickname = Column(String, nullable=True)
+    last_status = Column(String, nullable=True)
+    user = relationship("User", back_populates="parcels")
+
+
+async def init_db():
+    engine = create_async_engine(DATABASE_URL, echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+# Utility classes and functions
+_morph = None
+
+
+def get_morph():
+    global _morph
+    if _morph is None:
+        _morph = pymorphy2.MorphAnalyzer()
+    return _morph
+
+
+def clean_username(text: str) -> str:
+    text = re.sub(
+        r"[\s\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\ufeff\u3164\u00a0]",
+        "",
+        text.strip(),
+    ).lower()
+    parsed = get_morph().parse(text)
+    normal = parsed[0].normal_form if parsed else text
+    if not re.match(r"^[a-z0-9_]+$", normal):
+        raise ValueError("Invalid username format")
+    return normal
+
+
+def async_db_session():
+    engine = create_async_engine(os.getenv("DATABASE_URL"), echo=False)
+    AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            try:
-                return await func(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"Ошибка в {func.__name__}: {e}", exc_info=True)
-                if send_error_message and len(args) >= 2:
-                    update = args[0] if hasattr(args[0], "message") else args[1]
-                    try:
-                        await safe_send_message(
-                            update, "❌ Произошла ошибка. Пожалуйста, попробуйте позже."
-                        )
-                    except:
-                        pass
-                return None
+            # DEBUG: Argüman sayısını kontrol et
+            print(
+                f"DEBUG {func.__name__}: args count = {len(args)}, args = {[type(arg).__name__ for arg in args]}"
+            )
+
+            async with AsyncSessionLocal() as session:
+                try:
+                    result = await func(session, *args, **kwargs)
+                    await session.commit()
+                    return result
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(f"Database error in {func.__name__}: {e}")
+                    raise
+                finally:
+                    await session.close()
 
         return wrapper
 
     return decorator
 
 
-# Менеджер HTTP-клиента
+def handle_errors(send_error_message: bool = True):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            limiter = AsyncLimiter(1, 1)
+            async with limiter:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
+                    if send_error_message:
+                        # Find the Update object in args
+                        update = None
+                        for arg in args:
+                            if hasattr(
+                                arg, "effective_user"
+                            ):  # This is likely an Update object
+                                update = arg
+                                break
+
+                        if update:
+                            try:
+                                await safe_send_message(
+                                    update,
+                                    "❌ An error occurred. Please try again later.",
+                                )
+                            except:
+                                pass
+                    return None
+
+        return wrapper
+
+    return decorator
+
+
 class HTTPManager:
     _session = None
 
@@ -186,17 +230,14 @@ class HTTPManager:
             await cls._session.close()
 
 
-# Обработчик сообщений
 class TextMessageHandler:
     @staticmethod
     def split_message(text: str, max_length: int = None) -> List[str]:
         max_length = max_length or config.MAX_MESSAGE_LENGTH
         if len(text) <= max_length:
             return [text]
-
         parts = []
         current = ""
-
         for line in text.split("\n"):
             if len(current + line + "\n") > max_length:
                 if current:
@@ -217,83 +258,120 @@ class TextMessageHandler:
                     current = line + "\n"
             else:
                 current += line + "\n"
-
         if current:
             parts.append(current.rstrip())
-
         return parts
 
 
-# Менеджер кэша
 class CacheManager:
-    _cache: Dict = {}
+    _redis = None
 
     @classmethod
-    def get(cls, key: str) -> Optional[Any]:
-        if key in cls._cache:
-            data, timestamp = cls._cache[key]
-            if asyncio.get_event_loop().time() - timestamp < config.CACHE_TTL:
-                return data
-            del cls._cache[key]
+    async def init(cls):
+        cls._redis = redis.Redis(host="redis", port=6379, db=0, decode_responses=True)
+
+    @classmethod
+    async def get(cls, key: str) -> Optional[Any]:
+        if not cls._redis:
+            return None
+        data = await cls._redis.get(key)
+        if data:
+            ttl = await cls._redis.ttl(key)
+            if ttl > 0:
+                return json.loads(data)
         return None
 
     @classmethod
-    def set(cls, key: str, value: Any):
-        cls._cache[key] = (value, asyncio.get_event_loop().time())
+    async def set(cls, key: str, value: Any):
+        if not cls._redis:
+            return
+        await cls._redis.setex(key, config.CACHE_TTL, json.dumps(value))
+
+    @classmethod
+    async def close(cls):
+        if cls._redis:
+            await cls._redis.aclose()
 
 
-# API Boxberry
+class DataManager:
+    _instance = None
+    _keywords = None
+    _restrictions = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @property
+    def keywords(self) -> Dict:
+        if self._keywords is None:
+            try:
+                with open("keywords_mapping.json", "r", encoding="utf-8") as f:
+                    self._keywords = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to load keywords: {e}")
+                self._keywords = {}
+        return self._keywords
+
+    @property
+    def restrictions(self) -> Dict:
+        if self._restrictions is None:
+            try:
+                with open("restrictions.json", "r", encoding="utf-8") as f:
+                    self._restrictions = json.load(f)["countries"]
+            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+                logger.error(f"Failed to load restrictions: {e}")
+                self._restrictions = {}
+        return self._restrictions
+
+
+data_manager = DataManager()
+
+
 class BoxberryAPI:
     @staticmethod
     async def get_cities(city_name: str) -> List[Dict[str, str]]:
+        if len(city_name) < 2:
+            return []
+
         cache_key = f"cities_{city_name.lower()}"
-        cached = CacheManager.get(cache_key)
+        cached = await CacheManager.get(cache_key)
         if cached:
             return cached
 
         for attempt in range(config.MAX_RETRIES):
             try:
                 async with HTTPManager.get_session() as session:
-                    url = "https://lk.boxberry.ru/int-import-api/get-cities-list/"
-                    params = {"q": city_name}
+                    url = "https://lk.boxberry.ru/int-import-api/get-cities-list"
+                    params = {"country_code": "RU", "q": city_name}
+
                     async with session.get(url, params=params) as response:
                         if response.status == 200:
-                            data = await response.text()
-                            cities = BoxberryAPI._parse_cities_xml(data)
-                            CacheManager.set(cache_key, cities)
+                            text = await response.text()
+                            root = ET.fromstring(text)
+                            cities = [
+                                {
+                                    "code": item.find("id").text,
+                                    "name": item.find("text").text,
+                                }
+                                for item in root.findall("item")
+                                if item.find("id") is not None
+                                and item.find("text") is not None
+                            ]
+                            await CacheManager.set(cache_key, cities)
                             return cities
                         elif attempt < config.MAX_RETRIES - 1:
                             await asyncio.sleep(2**attempt)
                             continue
                         else:
                             return []
-            except asyncio.TimeoutError:
-                logger.error(f"Тайм-аут на попытке {attempt + 1}")
-                if attempt < config.MAX_RETRIES - 1:
-                    await asyncio.sleep(2**attempt)
-                    continue
-            except Exception as e:
-                logger.error(f"Ошибка API: {e}")
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.error(f"Error fetching cities on attempt {attempt + 1}: {e}")
                 if attempt < config.MAX_RETRIES - 1:
                     await asyncio.sleep(2**attempt)
                     continue
         return []
-
-    @staticmethod
-    def _parse_cities_xml(xml_data: str) -> List[Dict[str, str]]:
-        try:
-            root = ET.fromstring(xml_data)
-            return [
-                {"id": item.find("id").text, "text": item.find("text").text}
-                for item in root.findall("item")
-                if item.find("id") is not None
-                and item.find("text") is not None
-                and item.find("id").text
-                and item.find("text").text
-            ]
-        except ET.ParseError as e:
-            logger.error(f"Ошибка парсинга XML: {e}")
-            return []
 
     @staticmethod
     async def calculate_delivery_cost(
@@ -313,7 +391,7 @@ class BoxberryAPI:
                         if response.status == 200:
                             data = await response.text()
                             if not data.strip():
-                                logger.error("API вернул пустой ответ")
+                                logger.error("API returned empty response")
                                 return None
                             try:
                                 root = ET.fromstring(data)
@@ -323,400 +401,188 @@ class BoxberryAPI:
                                     error_text = (
                                         error_msg.text
                                         if error_msg is not None
-                                        else "Неизвестная ошибка"
+                                        else "Unknown error"
                                     )
-                                    logger.error(f"Ошибка расчета: {error_text}")
+                                    logger.error(f"Calculation error: {error_text}")
                                     return None
                                 cost_elem = root.find("cost")
-                                return cost_elem.text if cost_elem is not None else None
+                                return (
+                                    f"Cost: {cost_elem.text} ₽"
+                                    if cost_elem is not None
+                                    else None
+                                )
                             except ET.ParseError as xml_err:
-                                logger.error(f"Ошибка парсинга XML: {xml_err}")
+                                logger.error(f"XML parsing error: {xml_err}")
                                 return None
                         elif attempt < config.MAX_RETRIES - 1:
                             await asyncio.sleep(2**attempt)
                             continue
                         return None
             except asyncio.TimeoutError:
-                logger.error(f"Тайм-аут на попытке {attempt + 1}")
+                logger.error(f"Timeout on attempt {attempt + 1}")
                 if attempt < config.MAX_RETRIES - 1:
                     await asyncio.sleep(2**attempt)
                     continue
             except Exception as e:
-                logger.error(f"Ошибка запроса расчета: {e}")
+                logger.error(f"Calculation request error: {e}")
                 if attempt < config.MAX_RETRIES - 1:
                     await asyncio.sleep(2**attempt)
                     continue
-        return None
+        return "Calculation error"
 
 
-# Функции обработки сообщений
+# Telegram bot handlers
 async def safe_send_message(
-    update, text: str, reply_markup=None, parse_mode="Markdown", **kwargs
+    update: Update, text: str, reply_markup=None, parse_mode=None
 ):
     try:
         parts = TextMessageHandler.split_message(text)
-        for i, part in enumerate(parts):
-            reply_markup = reply_markup if i == len(parts) - 1 else None
-            await update.message.reply_text(
-                part, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs
+        if update.message:
+            msg = await update.message.reply_text(
+                parts[0], reply_markup=reply_markup, parse_mode=parse_mode
             )
+            for part in parts[1:]:
+                await msg.reply_text(part, parse_mode=parse_mode)
+        elif update.callback_query:
+            msg = await update.callback_query.message.reply_text(
+                parts[0], reply_markup=reply_markup, parse_mode=parse_mode
+            )
+            for part in parts[1:]:
+                await msg.reply_text(part, parse_mode=parse_mode)
     except Exception as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
+        logger.error(f"Error sending message: {e}")
 
 
-async def safe_edit_message(
-    query, text: str, reply_markup=None, parse_mode="Markdown", **kwargs
-):
+async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=None):
     try:
-        current_text = getattr(query.message, "text", "") or ""
-        if current_text == text:
-            return
+        if reply_markup is None:
+            reply_markup = InlineKeyboardMarkup([])
         parts = TextMessageHandler.split_message(text)
         if len(parts) == 1:
             await query.edit_message_text(
-                text, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs
+                parts[0], reply_markup=reply_markup, parse_mode=parse_mode
             )
         else:
-            await query.edit_message_text(
-                parts[0], reply_markup=None, parse_mode=parse_mode, **kwargs
+            await query.message.delete()
+            await safe_send_message(
+                query, text, reply_markup=reply_markup, parse_mode=parse_mode
             )
-            for i, part in enumerate(parts[1:], 1):
-                reply_markup = reply_markup if i == len(parts) - 1 else None
-                await query.message.reply_text(
-                    part, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs
-                )
     except Exception as e:
-        logger.error(f"Ошибка редактирования сообщения: {e}")
+        logger.error(f"Error editing message: {e}")
         try:
-            await query.message.reply_text(
-                text, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs
+            await query.message.delete()
+            await safe_send_message(
+                query, text, reply_markup=reply_markup, parse_mode=parse_mode
             )
         except:
             pass
 
 
-# Утилитные функции
 def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
-        ["📦 Мои посылки", "💰 Калькулятор"],
-        ["📋 BxBox Правила", "🌍 СНГ страны"],
-        ["🎫 Создать тикет", "❓ Помощь"],
-        ["👤 Профиль"],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [
+            ["📦 Мои посылки", "💰 Калькулятор"],
+            ["📋 BxBox Правила", "🌍 Россия → СНГ , Международные → Россия"],
+            ["🎫 Создать тикет", "❓ Помощь"],
+            ["👤 Профиль"],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def get_profile_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
-        ["🔑 Изменить пароль", "📍 Изменить адрес"],
-        ["📋 Мои посылки", "🏠 Главное меню"],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-def normalize_text(text: str) -> str:
-    words = re.findall(r"\w+", text.lower())
-    return " ".join([morph.parse(word)[0].normal_form for word in words])
-
-
-# Обработчики
-@handle_errors()
-@async_db_session
-async def start(session, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = session.query(User).filter_by(telegram_id=update.effective_user.id).first()
-    text = (
-        "🌟 Добро пожаловать в Boxberry Bot!\n\n"
-        "Я помогу вам:\n"
-        "📦 Отслеживать посылки\n"
-        "💰 Рассчитывать стоимость доставки\n"
-        "❓ Получать информацию о доставке\n\n"
-        "Для доступа к 'Мои посылки' и 'Профиль' зарегистрируйтесь или войдите:"
-    )
-    keyboard = [
-        ["📦 Мои посылки", "💰 Калькулятор"],
-        ["📋 BxBox Правила", "🌍 СНГ страны"],
-        ["🎫 Создать тикет", "❓ Помощь"],
-        ["👤 Профиль"],
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton("📝 Регистрация", callback_data="register"),
-            InlineKeyboardButton("🔑 Войти", callback_data="login"),
+            ["🔑 Изменить пароль", "📍 Изменить адрес"],
+            ["📋 Мои посылки", "🏠 Главное меню"],
         ],
-    ]
-    await safe_send_message(
-        update,
-        text,
-        reply_markup=ReplyKeyboardMarkup(keyboard[:4], resize_keyboard=True),
+        resize_keyboard=True,
     )
 
 
-@handle_errors()
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "❓ **Помощь по Boxberry Bot**\n\n"
-        "Я могу ответить на ваши вопросы. Просто напишите, что вас интересует, например:\n"
-        "`Cколько стоит доставка?`\n"
-        "`Kак упаковать посылку?`\n\n"
-        "**Или воспользуйтесь кнопками ниже:**"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📚 Частые вопросы (FAQ)",
-                url="https://boxberry.ru/faq/chastnym-klientam-voprosy-i-otvety",
-            ),
-            InlineKeyboardButton(
-                "☎️ Служба поддержки", url="https://boxberry.ru/kontakty"
-            ),
-        ]
-    ]
-    if update.message:
-        await safe_send_message(
-            update, text, reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    elif update.callback_query:
-        await safe_edit_message(
-            update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-
-@handle_errors()
-async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🔐 Регистрация\n\nВведите ваше имя пользователя (минимум 5 символов):"
-    if update.message:
-        await safe_send_message(update, text)
-    elif update.callback_query:
-        await safe_edit_message(update.callback_query, text)
-    return REGISTER_LOGIN
-
-
-@handle_errors()
-@async_db_session
-async def register_login_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    username = update.message.text.strip()
-    if len(username) < 5:
-        await safe_send_message(
-            update,
-            "❌ Имя пользователя должно содержать минимум 5 символов. Попробуйте снова:",
-        )
-        return REGISTER_LOGIN
-    existing_user = session.query(User).filter_by(username=username).first()
-    if existing_user:
-        await safe_send_message(
-            update,
-            "❌ Это имя пользователя уже занято. Попробуйте другое или войдите с помощью /login.",
-        )
-        return ConversationHandler.END
-    context.user_data["reg_username"] = username
-    await safe_send_message(update, "🔒 Введите пароль (минимум 6 символов):")
-    return REGISTER_PASSWORD
-
-
-@handle_errors()
-@async_db_session
-async def register_password_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    password = update.message.text.strip()
-    if len(password) < 6:
-        await safe_send_message(
-            update, "❌ Пароль должен содержать минимум 6 символов. Попробуйте снова:"
-        )
-        return REGISTER_PASSWORD
-    if password.isdigit() or password.isalpha():
-        await safe_send_message(
-            update,
-            "⚠️ Рекомендуется использовать пароль с цифрами и буквами для большей безопасности.",
-        )
-    context.user_data["reg_password"] = password
-    await safe_send_message(update, "👤 Введите ваше имя:")
-    return REGISTER_NAME
-
-
-@handle_errors()
-@async_db_session
-async def register_name_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    name = update.message.text.strip()
-    if not name:
-        await safe_send_message(
-            update, "❌ Имя не может быть пустым. Попробуйте снова:"
-        )
-        return REGISTER_NAME
-    context.user_data["reg_first"] = name
-    await safe_send_message(update, "👥 Введите вашу фамилию:")
-    return REGISTER_SURNAME
-
-
-@handle_errors()
-@async_db_session
-async def register_surname_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    surname = update.message.text.strip()
-    if not surname:
-        await safe_send_message(
-            update, "❌ Фамилия не может быть пустой. Попробуйте снова:"
-        )
-        return REGISTER_SURNAME
-    data = context.user_data
-    try:
-        user = db_get_or_create_user(
-            session, update.effective_user.id, update.effective_user.username
-        )
-        user.username = data["reg_username"]
-        user.password = data["reg_password"]
-        user.first_name = data["reg_first"]
-        user.last_name = surname
-        session.add(user)
+async def get_my_parcels_content(
+    session: AsyncSession, user: Optional[User]
+) -> Tuple[str, InlineKeyboardMarkup]:
+    if not user or not user.username:
         text = (
-            f"✅ Регистрация завершена!\n\n"
-            f"👤 Имя: {user.first_name} {user.last_name}\n"
-            f"📧 Имя пользователя: {user.username}\n\n"
-            f"Теперь вы можете пользоваться всеми функциями бота!"
+            "📦 **Мои посылки**\n\n"
+            "Для сохранения и управления трек-номерами войдите в аккаунт или зарегистрируйтесь.\n\n"
+            "💡 Без регистрации вы можете:\n"
+            "• Отслеживать любой трек-номер\n"
+            "• Пользоваться калькулятором\n"
+            "• Получать информацию о доставке\n\n"
+            "🔐 С аккаунтом дополнительно:\n"
+            "• Сохранение трек-номеров\n"
+            "• История отслеживания\n"
+            "• Уведомления об изменениях"
         )
-        await safe_send_message(update, text, reply_markup=get_main_menu_keyboard())
-    except IntegrityError:
-        session.rollback()
-        await safe_send_message(
-            update, "❌ Произошла ошибка при регистрации. Попробуйте еще раз."
-        )
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-@handle_errors()
-async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🔑 Вход\n\nВведите ваше имя пользователя:"
-    if update.message:
-        await safe_send_message(update, text)
-    elif update.callback_query:
-        await safe_edit_message(update.callback_query, text)
-    return LOGIN_LOGIN
-
-
-@handle_errors()
-@async_db_session
-async def login_login_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    username = update.message.text.strip()
-    if not username:
-        await safe_send_message(update, "❌ Введите корректное имя пользователя:")
-        return LOGIN_LOGIN
-    context.user_data["login_username"] = username
-    await safe_send_message(update, "🔒 Введите пароль:")
-    return LOGIN_PASSWORD
-
-
-@handle_errors()
-@async_db_session
-async def login_password_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    username = context.user_data.get("login_username")
-    password_text = update.message.text.strip()
-    user = (
-        session.query(User).filter_by(username=username, password=password_text).first()
-    )
-    if not user:
-        await safe_send_message(
-            update,
-            "❌ Неверное имя пользователя или пароль. Попробуйте снова или зарегистрируйтесь /register.",
-            reply_markup=get_main_menu_keyboard(),
-        )
-        context.user_data.clear()
-        return ConversationHandler.END
-    user.telegram_id = update.effective_user.id
-    user.telegram_username = update.effective_user.username
-    text = f"✅ Вход выполнен!\n\n👤 Добро пожаловать, {user.first_name}!"
-    await safe_send_message(update, text, reply_markup=get_main_menu_keyboard())
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-@handle_errors()
-@async_db_session
-async def profile_cmd(session, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = session.query(User).filter_by(telegram_id=update.effective_user.id).first()
-    if not user or not user.username:
-        await safe_send_message(
-            update,
-            "❌ Для доступа к профилю необходимо войти в аккаунт. Пожалуйста, используйте /register или /login.",
-            reply_markup=get_main_menu_keyboard(),
-        )
-        return
-    parcels_count = session.query(Parcel).filter_by(user_id=user.id).count()
-    text = (
-        f"👤 **Ваш профиль**\n\n"
-        f"**Имя:** {user.first_name or 'не указано'} {user.last_name or ''}\n"
-        f"**Имя пользователя:** `{user.username}`\n"
-        f"**Посылок отслеживается:** {parcels_count}\n"
-        f"**Дата регистрации:** {user.created_at.strftime('%d.%m.%Y') if hasattr(user, 'created_at') and user.created_at else 'не указана'}"
-    )
-    await safe_send_message(update, text, reply_markup=get_profile_keyboard())
-
-
-@handle_errors()
-async def change_password_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send_message(update, "Введите старый пароль:")
-    return CHANGE_OLD_PASSWORD
-
-
-@handle_errors()
-@async_db_session
-async def change_old_password_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    old_password = update.message.text.strip()
-    user = session.query(User).filter_by(telegram_id=update.effective_user.id).first()
-    if not user or user.password != old_password:
-        await safe_send_message(update, "❌ Неверный старый пароль. Попробуйте снова.")
-        return CHANGE_OLD_PASSWORD
-    await safe_send_message(update, "Введите новый пароль (минимум 6 символов):")
-    return CHANGE_NEW_PASSWORD
-
-
-@handle_errors()
-@async_db_session
-async def change_new_password_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    new_password = update.message.text.strip()
-    if len(new_password) < 6:
-        await safe_send_message(
-            update,
-            "❌ Новый пароль должен содержать минимум 6 символов. Попробуйте снова:",
-        )
-        return CHANGE_NEW_PASSWORD
-    user = session.query(User).filter_by(telegram_id=update.effective_user.id).first()
-    if not user:
-        await safe_send_message(update, "❌ Пользователь не найден.")
-        return ConversationHandler.END
-    user.password = new_password
-    await safe_send_message(
-        update, "✅ Пароль успешно изменен!", reply_markup=get_profile_keyboard()
-    )
-    return ConversationHandler.END
-
-
-@handle_errors()
-@async_db_session
-async def my_parcels_cmd(session, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = session.query(User).filter_by(telegram_id=update.effective_user.id).first()
-    if not user or not user.username:
         keyboard = [
             [
                 InlineKeyboardButton("📝 Регистрация", callback_data="register"),
                 InlineKeyboardButton("🔑 Войти", callback_data="login"),
             ],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
         ]
+        return text, InlineKeyboardMarkup(keyboard)
+    parcels = (
+        (
+            await session.execute(
+                select(Parcel)
+                .filter_by(user_id=user.telegram_id)
+                .options(selectinload(Parcel.user))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not parcels:
+        text = "📦 У вас нет сохраненных посылок.\n\n💡 Добавьте трек-номер для отслеживания."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "➕ Добавить трек", callback_data="add_new_tracking"
+                )
+            ],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+        ]
+        return text, InlineKeyboardMarkup(keyboard)
+    text = "📦 **Ваши посылки:**\n\n"
+    keyboard = []
+    for parcel in parcels:
+        display_name = parcel.nickname or parcel.tracking_number
+        text += f"• `{display_name}` - {parcel.last_status or 'Неизвестно'}\n"
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    display_name, callback_data=f"track_{parcel.tracking_number}"
+                )
+            ]
+        )
+    keyboard.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Добавить трек", callback_data="add_new_tracking"
+                )
+            ],
+            [InlineKeyboardButton("🗑 Удалить посылку", callback_data="start_delete")],
+            [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_parcels")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+        ]
+    )
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+@handle_errors()
+@async_db_session()
+async def my_parcels_cmd(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    user = await session.get(User, update.effective_user.id)
+    if not user or not user.username:
+        text, reply_markup = await get_my_parcels_content(session, user)
         await safe_send_message(
-            update,
-            "❌ Для доступа к посылкам необходимо войти в аккаунт.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            update, text, reply_markup=reply_markup, parse_mode="Markdown"
         )
         return
     for msg_key in ["my_parcels_message_id", "last_tracking_message_id"]:
@@ -736,164 +602,724 @@ async def my_parcels_cmd(session, update: Update, context: ContextTypes.DEFAULT_
     context.user_data["my_parcels_message_id"] = message.message_id
 
 
-async def get_my_parcels_content(session, user) -> Tuple[str, InlineKeyboardMarkup]:
-    parcels = session.query(Parcel).filter_by(user_id=user.id).all()
-    if not parcels:
-        text = "У вас пока нет отслеживаемых посылок.\nИспользуйте кнопку ниже, чтобы добавить первую."
+@handle_errors()
+@async_db_session()
+async def profile_cmd(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    user = await session.get(User, update.effective_user.id)
+    if not user or not user.username:
+        text = (
+            "👤 **Профиль**\n\n"
+            "У вас пока нет аккаунта.\n\n"
+            "🔐 Создайте аккаунт, чтобы:\n"
+            "• Сохранять трек-номера\n"
+            "• Получать уведомления\n"
+            "• Вести историю отслеживания\n\n"
+            "💡 Без аккаунта доступны все основные функции бота."
+        )
         keyboard = [
             [
-                InlineKeyboardButton(
-                    "➕ Добавить трек-номер", callback_data="add_new_tracking"
-                )
-            ]
+                InlineKeyboardButton("📝 Регистрация", callback_data="register"),
+                InlineKeyboardButton("🔑 Войти", callback_data="login"),
+            ],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
         ]
-    else:
-        text = f"📦 Ваши посылки: {len(parcels)}\n\n"
-        keyboard = []
-        for i, parcel in enumerate(parcels, 1):
-            status = parcel.last_status or "Статус не определен"
-            text += f"**{i}.** `{parcel.tracking_number}`\n"
-            text += f"📊 _{status}_\n\n"
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"🔍 {parcel.tracking_number}",
-                        callback_data=f"track_{parcel.tracking_number}",
-                    )
-                ]
+        await safe_send_message(
+            update,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+        return
+    parcels_count = (
+        await session.execute(
+            select(func.count()).select_from(Parcel).filter_by(user_id=user.telegram_id)
+        )
+    ).scalar()
+    text = (
+        f"👤 **Ваш профиль**\n\n"
+        f"**Имя:** {user.first_name or 'не указано'} {user.last_name or ''}\n"
+        f"**Имя пользователя:** `{user.username or 'не указано'}`\n"
+        f"**Посылок отслеживается:** {parcels_count}\n"
+        f"**Дата регистрации:** {user.created_at.strftime('%d.%m.%Y') if user.created_at else 'не указана'}"
+    )
+    await safe_send_message(
+        update, text, reply_markup=get_profile_keyboard(), parse_mode="Markdown"
+    )
+
+
+async def send_tracking_info(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tracking_number: str,
+    additional_text: str = "",
+):
+    tracking_url = f"{config.BASE_URL}/tracking-page?id={tracking_number}"
+    keyboard = [[InlineKeyboardButton("🔍 Отследить на сайте", url=tracking_url)]]
+    message_text = f"📦 Трек-номер: `{tracking_number}` {additional_text}"
+    if "last_tracking_message_id" in context.user_data:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data["last_tracking_message_id"],
             )
-        keyboard.append(
-            [
-                InlineKeyboardButton("🗑️ Удалить", callback_data="start_delete"),
-                InlineKeyboardButton(
-                    "➕ Добавить новый", callback_data="add_new_tracking"
-                ),
-            ]
+        except Exception as e:
+            logger.warning(f"Failed to delete message: {e}")
+    try:
+        msg = await (update.message or update.callback_query.message).reply_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
         )
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "🔄 Обновить статусы", callback_data="refresh_parcels"
-                )
-            ]
-        )
-    return text, InlineKeyboardMarkup(keyboard)
+        context.user_data["last_tracking_message_id"] = msg.message_id
+    except Exception as e:
+        logger.error(f"Failed to send tracking info: {e}")
+
+
+async def db_get_or_create_user(
+    session: AsyncSession, telegram_id: int, telegram_username: Optional[str] = None
+) -> User:
+    user = (
+        await session.execute(select(User).filter_by(telegram_id=telegram_id))
+    ).scalar_one_or_none()
+    if user:
+        if telegram_username and user.telegram_username != telegram_username:
+            user.telegram_username = telegram_username
+        return user
+    user = User(telegram_id=telegram_id, telegram_username=telegram_username)
+    session.add(user)
+    await session.flush()
+    return user
 
 
 @handle_errors()
-@async_db_session
-async def add_tracking_received(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
+@async_db_session()
+async def start(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    code = update.message.text.strip().upper()
-    if not TRACKING_PATTERN.match(code):
-        await safe_send_message(
-            update, "❌ Некорректный формат трек-номера. Попробуйте снова:"
+    context.user_data.clear()
+    user = await session.get(User, update.effective_user.id)
+    if user and user.username:
+        text = (
+            f"🌟 Добро пожаловать, {user.first_name or 'пользователь'}!\n\n"
+            "Я помогу вам:\n"
+            "📦 Отслеживать и сохранять посылки\n"
+            "💰 Рассчитывать стоимость доставки\n"
+            "❓ Получать информацию о доставке\n\n"
+            "Выберите действие:"
         )
-        return ADD_TRACKING
-    user = db_get_or_create_user(session, update.effective_user.id)
-    if not user.username:
-        await safe_send_message(
-            update,
-            "❌ Для добавления посылки необходимо войти в аккаунт. Используйте /login или /register.",
-            reply_markup=get_main_menu_keyboard(),
-        )
-        return ConversationHandler.END
-    exists = (
-        session.query(Parcel).filter_by(user_id=user.id, tracking_number=code).first()
-    )
-    if exists:
-        await safe_send_message(update, "ℹ️ Этот трек-номер уже есть в вашем списке.")
     else:
-        parcel = Parcel(user_id=user.id, tracking_number=code, last_status="Добавлено")
-        session.add(parcel)
-        await safe_send_message(update, "✅ Трек-номер успешно добавлен!")
-    for msg_key in ["add_prompt_id"]:
-        if msg_key in context.user_data:
-            try:
-                await context.bot.delete_message(
-                    chat_id=update.effective_chat.id,
-                    message_id=context.user_data[msg_key],
-                )
-                del context.user_data[msg_key]
-            except:
-                pass
-    try:
-        await context.bot.delete_message(
-            chat_id=update.effective_chat.id, message_id=update.message.message_id
+        text = (
+            "🌟 Добро пожаловать в Boxberry Bot!\n\n"
+            "Я помогу вам:\n"
+            "📦 Отслеживать посылки\n"
+            "💰 Рассчитывать стоимость доставки\n"
+            "❓ Получать информацию о доставке\n\n"
+            "💡 Все функции доступны без регистрации!\n"
+            "🔐 Войдите в аккаунт для сохранения трек-номеров."
         )
-    except:
-        pass
-    await my_parcels_cmd(session, update, context)
+    await safe_send_message(
+        update, text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown"
+    )
+
+
+@handle_errors()
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_send_message(
+        update, "Действие отменено.", reply_markup=get_main_menu_keyboard()
+    )
+    context.user_data.clear()
     return ConversationHandler.END
 
 
-@async_db_session
-async def start_delete_menu(
-    session, update: Update, context: ContextTypes.DEFAULT_TYPE
+@handle_errors()
+async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    text = "🔐 Регистрация\n\nВведите ваше имя пользователя:"
+    if update.message:
+        await safe_send_message(update, text)
+    elif update.callback_query:
+        await safe_edit_message(update.callback_query, text)
+    return REGISTER_LOGIN
+
+
+@handle_errors()
+@async_db_session()
+async def register_login_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        username = clean_username(update.message.text)
+    except ValueError:
+        await safe_send_message(
+            update,
+            "❌ Имя пользователя должно содержать только буквы, цифры и подчеркивания. Попробуйте снова:",
+        )
+        return REGISTER_LOGIN
+    existing_user = (
+        await session.execute(select(User).filter_by(username=username))
+    ).scalar_one_or_none()
+    if existing_user:
+        await safe_send_message(
+            update, "❌ Это имя пользователя уже занято. Попробуйте другое:"
+        )
+        return REGISTER_LOGIN
+    context.user_data["reg_username"] = username
+    await safe_send_message(update, "🔒 Введите пароль (минимум 6 символов):")
+    return REGISTER_PASSWORD
+
+
+@handle_errors()
+@async_db_session()
+async def register_password_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    password = update.message.text.strip()
+    if len(password) < 6:
+        await safe_send_message(
+            update, "❌ Пароль должен содержать минимум 6 символов. Попробуйте снова:"
+        )
+        return REGISTER_PASSWORD
+    context.user_data["reg_password"] = generate_password_hash(password)
+    await safe_send_message(update, "👤 Введите ваше имя:")
+    return REGISTER_NAME
+
+
+@handle_errors()
+async def register_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await safe_send_message(
+            update, "❌ Имя не может быть пустым. Попробуйте снова:"
+        )
+        return REGISTER_NAME
+    context.user_data["reg_first"] = name
+    await safe_send_message(update, "👤 Введите вашу фамилию:")
+    return REGISTER_SURNAME
+
+
+@handle_errors()
+@async_db_session()
+async def register_surname_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    surname = update.message.text.strip()
+    if not surname:
+        await safe_send_message(
+            update, "❌ Фамилия не может быть пустой. Попробуйте снова:"
+        )
+        return REGISTER_SURNAME
+    data = context.user_data
+    try:
+        user = await db_get_or_create_user(
+            session, update.effective_user.id, update.effective_user.username
+        )
+        user.username = data["reg_username"]
+        user.password = data["reg_password"]
+        user.first_name = data["reg_first"]
+        user.last_name = surname
+        session.add(user)
+        await session.commit()
+        text = (
+            f"✅ Регистрация завершена!\n\n"
+            f"👤 Имя: {user.first_name} {user.last_name}\n"
+            f"📧 Имя пользователя: {user.username}\n\n"
+            f"Теперь вы можете сохранять трек-номера и пользоваться всеми функциями бота!"
+        )
+        await safe_send_message(
+            update, text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown"
+        )
+    except IntegrityError:
+        await safe_send_message(
+            update, "❌ Ошибка при регистрации. Попробуйте другое имя пользователя."
+        )
+        return REGISTER_LOGIN
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+@handle_errors()
+async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    text = "🔑 Вход в аккаунт\n\nВведите ваше имя пользователя:"
+    if update.message:
+        await safe_send_message(update, text)
+    elif update.callback_query:
+        await safe_edit_message(update.callback_query, text)
+    return LOGIN_LOGIN
+
+
+@handle_errors()
+@async_db_session()
+async def login_login_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        username = clean_username(update.message.text)
+    except ValueError:
+        await safe_send_message(
+            update,
+            "❌ Имя пользователя должно содержать только буквы, цифры и подчеркивания. Попробуйте снова:",
+        )
+        return LOGIN_LOGIN
+    user = (
+        await session.execute(select(User).filter_by(username=username))
+    ).scalar_one_or_none()
+    if not user:
+        await safe_send_message(
+            update, "❌ Неверное имя пользователя. Попробуйте снова:"
+        )
+        return LOGIN_LOGIN
+    context.user_data["login_username"] = username
+    await safe_send_message(update, "🔒 Введите пароль:")
+    return LOGIN_PASSWORD
+
+
+@handle_errors()
+@async_db_session()
+async def login_password_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    username = context.user_data.get("login_username")
+    if not username:
+        await safe_send_message(update, "❌ Сессия истекла. Начните заново.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    user = (
+        await session.execute(select(User).filter_by(username=username))
+    ).scalar_one_or_none()
+    if not user:
+        await safe_send_message(update, "❌ Пользователь не найден.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    password = update.message.text.strip()
+    if not check_password_hash(user.password, password):
+        await safe_send_message(update, "❌ Неверный пароль. Попробуйте снова:")
+        return LOGIN_PASSWORD
+    # Update parcels user_id first to avoid foreign key violation
+    old_telegram_id = user.telegram_id
+    new_telegram_id = update.effective_user.id
+    if old_telegram_id != new_telegram_id:
+        await session.execute(
+            sa_update(Parcel)
+            .where(Parcel.user_id == old_telegram_id)
+            .values(user_id=new_telegram_id)
+        )
+    # Now update user
+    user.telegram_id = new_telegram_id
+    user.telegram_username = update.effective_user.username
+    await session.commit()
+    text = (
+        f"✅ Вход успешен!\n\n"
+        f"👤 Добро пожаловать, {user.first_name or user.username}!\n\n"
+        f"Вы можете использовать все функции аккаунта."
+    )
+    await safe_send_message(
+        update, text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+@handle_errors()
+async def add_tracking_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    text = "➕ Введите трек-номер для добавления:"
+    prompt_msg = await query.message.reply_text(text)
+    context.user_data["add_prompt_id"] = prompt_msg.message_id
+    return ADD_TRACKING
+
+
+@handle_errors()
+@async_db_session()
+async def add_tracking_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    tracking = update.message.text.strip().upper()
+    if not TRACKING_PATTERN.match(tracking):
+        await safe_send_message(
+            update,
+            "❌ Некорректный формат трек-номера (минимум 8 символов, буквы/цифры/-). Попробуйте снова:",
+        )
+        return ADD_TRACKING
+    user = await session.get(User, update.effective_user.id)
+    if not user or not user.username:
+        await safe_send_message(
+            update, "❌ Для сохранения посылок зарегистрируйтесь или войдите в аккаунт."
+        )
+        if "add_prompt_id" in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    update.effective_chat.id, context.user_data["add_prompt_id"]
+                )
+            except:
+                pass
+        context.user_data.clear()
+        return ConversationHandler.END
+    existing = (
+        await session.execute(
+            select(Parcel).filter_by(user_id=user.telegram_id, tracking_number=tracking)
+        )
+    ).scalar_one_or_none()
+    if existing:
+        await safe_send_message(
+            update, f"ℹ️ Трек-номер '{tracking}' уже сохранен в ваших посылках."
+        )
+        if "add_prompt_id" in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    update.effective_chat.id, context.user_data["add_prompt_id"]
+                )
+            except:
+                pass
+        context.user_data.clear()
+        return ConversationHandler.END
+    parcel = Parcel(
+        user_id=user.telegram_id, tracking_number=tracking, last_status="Добавлено"
+    )
+    session.add(parcel)
+    await safe_send_message(
+        update, f"✅ Трек-номер '{tracking}' успешно добавлен в 'Мои посылки'!"
+    )
+    if "add_prompt_id" in context.user_data:
+        try:
+            await context.bot.delete_message(
+                update.effective_chat.id, context.user_data["add_prompt_id"]
+            )
+        except:
+            pass
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+@handle_errors()
+@async_db_session()
+async def change_password_start(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    user = await session.get(User, update.effective_user.id)
+    if not user or not user.username:
+        await safe_send_message(
+            update,
+            "❌ Для изменения пароля необходимо иметь аккаунт. Зарегистрируйтесь или войдите.",
+        )
+        return ConversationHandler.END
+    text = "🔑 Изменение пароля\n\nВведите текущий пароль:"
+    await safe_send_message(update, text)
+    return CHANGE_OLD_PASSWORD
+
+
+@handle_errors()
+@async_db_session()
+async def change_old_password_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    user = await session.get(User, update.effective_user.id)
+    if not user or not user.password:
+        await safe_send_message(update, "❌ Ошибка: аккаунт не настроен.")
+        return ConversationHandler.END
+    old_password = update.message.text.strip()
+    if not check_password_hash(user.password, old_password):
+        await safe_send_message(update, "❌ Текущий пароль неверный. Попробуйте снова:")
+        return CHANGE_OLD_PASSWORD
+    context.user_data["old_password_verified"] = True
+    await safe_send_message(update, "🔒 Введите новый пароль (минимум 6 символов):")
+    return CHANGE_NEW_PASSWORD
+
+
+@handle_errors()
+@async_db_session()
+async def change_new_password_received(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    if not context.user_data.get("old_password_verified"):
+        await safe_send_message(update, "❌ Сессия истекла. Начните заново.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    new_password = update.message.text.strip()
+    if len(new_password) < 6:
+        await safe_send_message(
+            update,
+            "❌ Новый пароль должен содержать минимум 6 символов. Попробуйте снова:",
+        )
+        return CHANGE_NEW_PASSWORD
+    user = await session.get(User, update.effective_user.id)
+    if not user:
+        await safe_send_message(update, "❌ Ошибка аккаунта.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    user.password = generate_password_hash(new_password)
+    text = "✅ Пароль успешно изменен!\n\nТеперь используйте новый пароль для входа."
+    await safe_send_message(
+        update, text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+@handle_errors()
+async def calculator_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    text = "💰 Калькулятор доставки\n\nВыберите страну отправки:"
+    keyboard = [
+        [InlineKeyboardButton("🇺🇸 США", callback_data="calc_storage_usa")],
+        [InlineKeyboardButton("🇨🇳 Китай", callback_data="calc_storage_china")],
+        [InlineKeyboardButton("🇩🇪 Германия", callback_data="calc_storage_germany")],
+        [InlineKeyboardButton("🇪🇸 Испания", callback_data="calc_storage_spain")],
+        [InlineKeyboardButton("🇮🇳 Индия", callback_data="calc_storage_india")],
+        [InlineKeyboardButton("🔙 Отмена", callback_data="calc_cancel")],
+    ]
+    if update.message:
+        await safe_send_message(
+            update, text, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    elif update.callback_query:
+        await safe_edit_message(
+            update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    return CALC_STORAGE
+
+
+@handle_errors()
+async def calculator_storage_selected(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    user = session.query(User).filter_by(telegram_id=query.from_user.id).first()
-    if not user:
-        await query.answer("❌ Пользователь не найден.", show_alert=True)
-        return
-    parcels = session.query(Parcel).filter_by(user_id=user.id).all()
-    if not parcels:
-        await query.answer("Нет посылок для удаления.", show_alert=True)
-        return
+    await query.answer()
+    parts = query.data.split("_")
+    country = parts[-1]
+    storage_map = {
+        "usa": {"id": "1", "name": "США"},
+        "china": {"id": "2", "name": "Китай"},
+        "germany": {"id": "3", "name": "Германия"},
+        "spain": {"id": "4", "name": "Испания"},
+        "india": {"id": "5", "name": "Индия"},
+    }
+    if country not in storage_map:
+        text = "❌ Неизвестная страна. Попробуйте снова."
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data="calc_back_to_country")]
+        ]
+        await safe_edit_message(
+            query, text, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CALC_STORAGE
+    storage_info = storage_map[country]
+    context.user_data["storage_id"] = storage_info["id"]
+    context.user_data["storage_name"] = storage_info["name"]
+    text = f"📦 Страна выбрана: {storage_info['name']}\n\nВведите название города доставки (минимум 2 символа):"
+    await safe_edit_message(query, text)
+    return CALC_CITY_SEARCH
+
+
+@handle_errors()
+async def calculator_city_search_received(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    city_name = update.message.text.strip()
+    if len(city_name) < 2:
+        await safe_send_message(
+            update, "❌ Введите минимум 2 символа для поиска города."
+        )
+        return CALC_CITY_SEARCH
+    cities = await BoxberryAPI.get_cities(city_name)
+    if not cities:
+        text = "❌ Города не найдены. Попробуйте другой запрос."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🔙 Выбрать страну", callback_data="calc_back_to_country"
+                )
+            ]
+        ]
+        await safe_send_message(
+            update, text, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CALC_CITY_SEARCH
+    text = f"📍 Результаты поиска для '{city_name}':"
     keyboard = [
         [
             InlineKeyboardButton(
-                f"❌ {parcel.tracking_number}",
-                callback_data=f"del_{parcel.tracking_number}",
+                city["name"][:30] + "..." if len(city["name"]) > 30 else city["name"],
+                callback_data=f"calc_city_{city['code']}",
             )
         ]
-        for parcel in parcels
+        for city in cities[:10]
     ]
-    keyboard.append(
-        [InlineKeyboardButton("🔥🔥🔥 Удалить ВСЕ", callback_data="del_all")]
+    keyboard.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔍 Новый поиск", callback_data="calc_city_new_search"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 Выбрать страну", callback_data="calc_back_to_country"
+                )
+            ],
+        ]
     )
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_parcels")])
-    await safe_edit_message(
-        query,
-        "Выберите трек-номер для удаления:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await safe_send_message(update, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return CALC_CITY_SELECT
 
 
-@async_db_session
-async def handle_delete(
-    session,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    tracking: Optional[str] = None,
-    all: bool = False,
+@handle_errors()
+async def calculator_city_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    city_id = query.data.split("_", 2)[-1]
+    button_text = [
+        btn.text
+        for row in query.message.reply_markup.inline_keyboard
+        for btn in row
+        if btn.callback_data == query.data
+    ][0]
+    context.user_data["city_id"] = city_id
+    context.user_data["city_name"] = button_text
+    text = f"🏙️ Город: {button_text}\n\nВыберите тип доставки:"
+    keyboard = [
+        [InlineKeyboardButton("📦 До пункта выдачи", callback_data="calc_delivery_0")],
+        [InlineKeyboardButton("🚚 С курьером", callback_data="calc_delivery_1")],
+    ]
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return CALC_DELIVERY
+
+
+@handle_errors()
+async def calculator_city_new_search(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    user = session.query(User).filter_by(telegram_id=query.from_user.id).first()
-    if not user:
-        await query.answer("❌ Пользователь не найден.", show_alert=True)
-        return
-    if all:
-        deleted_count = session.query(Parcel).filter_by(user_id=user.id).delete()
-        await query.answer(f"🗑️ Удалено {deleted_count} посылок!", show_alert=True)
-    elif tracking:
-        parcel = (
-            session.query(Parcel)
-            .filter_by(user_id=user.id, tracking_number=tracking)
-            .first()
+    await query.answer()
+    text = "Введите название города доставки:"
+    await safe_edit_message(query, text)
+    return CALC_CITY_SEARCH
+
+
+@handle_errors()
+async def calc_back_to_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    text = "Выберите страну отправки:"
+    keyboard = [
+        [InlineKeyboardButton("🇺🇸 США", callback_data="calc_storage_usa")],
+        [InlineKeyboardButton("🇨🇳 Китай", callback_data="calc_storage_china")],
+        [InlineKeyboardButton("🇩🇪 Германия", callback_data="calc_storage_germany")],
+        [InlineKeyboardButton("🇪🇸 Испания", callback_data="calc_storage_spain")],
+        [InlineKeyboardButton("🇮🇳 Индия", callback_data="calc_storage_india")],
+        [InlineKeyboardButton("🔙 Отмена", callback_data="calc_cancel")],
+    ]
+    if query:
+        await safe_edit_message(
+            query, text, reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        if parcel:
-            session.delete(parcel)
-            await query.answer("🗑️ Посылка удалена!", show_alert=True)
+    else:
+        await safe_send_message(
+            update, text, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    return CALC_STORAGE
+
+
+@handle_errors()
+async def calculator_delivery_selected(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    courier = query.data.split("_")[-1] == "1"
+    context.user_data["courier"] = courier
+    text = "Введите вес посылки в кг (0.1 - 31.5):"
+    await safe_edit_message(query, text)
+    return CALC_WEIGHT
+
+
+@handle_errors()
+async def calculator_weight_received(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        weight = float(update.message.text.replace(",", "."))
+        if weight <= 0 or weight > 31.5:
+            await safe_send_message(
+                update, "❌ Вес должен быть от 0.1 до 31.5 кг. Попробуйте снова:"
+            )
+            return CALC_WEIGHT
+    except ValueError:
+        await safe_send_message(update, "❌ Некорректный вес. Попробуйте снова:")
+        return CALC_WEIGHT
+    storage_id = context.user_data["storage_id"]
+    city_id = context.user_data["city_id"]
+    courier = context.user_data["courier"]
+    cost = await BoxberryAPI.calculate_delivery_cost(
+        storage_id, city_id, weight, courier
+    )
+    text = f"💰 Результат расчета для {context.user_data['storage_name']}:\n\n{cost}\n\n💡 Это приблизительная стоимость. Точная зависит от габаритов и услуг."
+    keyboard = [
+        [InlineKeyboardButton("🔄 Новый расчет", callback_data="calc_new")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+    ]
+    await safe_send_message(
+        update, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+@handle_errors()
+async def calculator_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await query.message.reply_text(
+            "Расчет отменен.", reply_markup=get_main_menu_keyboard()
+        )
+    else:
+        await safe_send_message(
+            update, "Расчет отменен.", reply_markup=get_main_menu_keyboard()
+        )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+@handle_errors()
+async def keyword_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("kw_"):
+        key = data[3:]
+        choices = {
+            f"{k} {' '.join(v.get('keywords', []))}": k
+            for k, v in data_manager.keywords.items()
+        }
+        best_match = process.extractOne(
+            query.message.text if query.message else "", choices.keys()
+        )
+        if best_match and best_match[1] > 80:
+            selected_key = choices[best_match[0]]
+            text = data_manager.keywords.get(selected_key, {}).get(
+                "text", "Информация не найдена."
+            )
+            link = data_manager.keywords.get(selected_key, {}).get(
+                "link", config.BASE_URL
+            )
+            keyboard = [[InlineKeyboardButton("Подробнее", url=link)]]
+            await safe_edit_message(
+                query, text, reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         else:
-            await query.answer("ℹ️ Посылка не найдена.", show_alert=True)
-    text, reply_markup = await get_my_parcels_content(session, user)
-    await safe_edit_message(query, text, reply_markup=reply_markup)
+            await safe_edit_message(
+                query, "ℹ️ Информация не найдена. Попробуйте другой запрос."
+            )
 
 
 @handle_errors()
 async def bxbox_rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     keyboard = [
         [
             InlineKeyboardButton("🇺🇸 США", callback_data="rule_USA"),
@@ -922,7 +1348,17 @@ async def bxbox_rules_country_selected(
     rules = data_manager.restrictions.get(country_code)
     if not rules:
         await safe_edit_message(
-            query, "❌ Страна не найдена. Пожалуйста, выберите из списка."
+            query,
+            "❌ Страна не найдена. Пожалуйста, выберите из списка.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Назад к правилам", callback_data="back_to_rules"
+                        )
+                    ]
+                ]
+            ),
         )
         return
     text = f"📋 **Правила для отправлений: {country_code}**\n\n"
@@ -953,19 +1389,19 @@ async def bxbox_rules_country_selected(
     text += f"📏 **Максимальные параметры:**\n"
     text += f"• Вес: *{rules.get('max_weight', 'Нет данных')}*\n"
     text += f"• Размеры: *{rules.get('max_dimensions', 'Нет данных')}*"
-    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_rules")]]
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к правилам", callback_data="back_to_rules")]
+    ]
     await safe_edit_message(
-        query,
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        disable_web_page_preview=True,
+        query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
 
 
 @handle_errors()
 async def back_to_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if query:
+        await query.answer()
     keyboard = [
         [
             InlineKeyboardButton("🇺🇸 США", callback_data="rule_USA"),
@@ -977,286 +1413,265 @@ async def back_to_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("🇮🇳 Индия", callback_data="rule_India")],
     ]
-    await safe_edit_message(
-        query,
-        "Выберите страну для просмотра ограничений:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-@handle_errors()
-async def create_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🎫 Для создания обращения (тикетов) или оформления заявки на выкуп, пожалуйста, перейдите на наш сайт."
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📝 Открыть форму на сайте",
-                url="https://bxbox.bxb.delivery/ru/new-ticket/2",
-            )
-        ]
-    ]
-    await safe_send_message(update, text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-@handle_errors()
-async def calculator_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🇺🇸 США", callback_data="calc_storage_usa")],
-        [InlineKeyboardButton("🇨🇳 Китай", callback_data="calc_storage_china")],
-        [InlineKeyboardButton("🇩🇪 Германия", callback_data="calc_storage_germany")],
-        [InlineKeyboardButton("🇪🇸 Испания", callback_data="calc_storage_spain")],
-        [InlineKeyboardButton("🇮🇳 Индия", callback_data="calc_storage_india")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="calc_cancel")],
-    ]
-    text = "💰 **Калькулятор доставки**\n\nВыберите страну склада:"
-    if update.callback_query:
+    text = "Выберите страну для просмотра ограничений:"
+    if query:
         await safe_edit_message(
-            update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard)
+            query, text, reply_markup=InlineKeyboardMarkup(keyboard)
         )
     else:
         await safe_send_message(
             update, text, reply_markup=InlineKeyboardMarkup(keyboard)
         )
-    return CALC_STORAGE
 
 
 @handle_errors()
-async def calculator_storage_selected(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+@async_db_session()
+async def start_delete_menu(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    await query.answer()
-    storage_map = {
-        "calc_storage_usa": {"id": "1", "name": "🇺🇸 США"},
-        "calc_storage_china": {"id": "2", "name": "🇨🇳 Китай"},
-        "calc_storage_germany": {"id": "3", "name": "🇩🇪 Германия"},
-        "calc_storage_spain": {"id": "4", "name": "🇪🇸 Испания"},
-        "calc_storage_india": {"id": "5", "name": "🇮🇳 Индия"},
-    }
-    storage_info = storage_map.get(query.data)
-    if not storage_info:
-        await safe_edit_message(query, "❌ Ошибка выбора склада. Начните заново.")
-        return ConversationHandler.END
-    context.user_data["calc_storage_id"] = storage_info["id"]
-    context.user_data["calc_storage_name"] = storage_info["name"]
-    await safe_edit_message(
-        query,
-        f"📦 Склад: {storage_info['name']}\n\n🏙️ Введите название города получателя (например: Москва):",
-    )
-    return CALC_CITY_SEARCH
-
-
-@handle_errors()
-async def calculator_city_search_received(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    city_name = update.message.text.strip()
-    if len(city_name) < 2:
-        await safe_send_message(
-            update,
-            "❌ Название города должно содержать минимум 2 символа. Попробуйте снова:",
+    user = await session.get(User, query.from_user.id)
+    if not user or not user.username:
+        await query.answer(
+            "❌ Для удаления посылок необходимо войти в аккаунт.", show_alert=True
         )
-        return CALC_CITY_SEARCH
-    search_msg = await update.message.reply_text("🔍 Поиск городов...")
-    cities = await BoxberryAPI.get_cities(city_name)
-    await search_msg.delete()
-    if not cities:
-        await safe_send_message(
-            update, "❌ Города не найдены.\n\nПопробуйте другое название:"
-        )
-        return CALC_CITY_SEARCH
-    keyboard = [
-        [InlineKeyboardButton(city["text"], callback_data=f"calc_city_{city['id']}")]
-        for city in cities[:15]
-    ]
-    keyboard.append(
-        [InlineKeyboardButton("🔍 Новый поиск", callback_data="calc_city_new_search")]
+        return
+    parcels = (
+        (await session.execute(select(Parcel).filter_by(user_id=user.telegram_id)))
+        .scalars()
+        .all()
     )
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="calc_cancel")])
-    storage_name = context.user_data.get("calc_storage_name", "")
-    await safe_send_message(
-        update,
-        f"📦 Склад: {storage_name}\n🏙️ Найденные города для '{city_name}':\n\nВыберите город:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return CALC_CITY_SELECT
-
-
-@handle_errors()
-async def calculator_city_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    city_id = query.data.replace("calc_city_", "")
-    inline_keyboard = (
-        query.message.reply_markup.inline_keyboard if query.message.reply_markup else []
-    )
-    selected_city_name = "Выбранный город"
-    for row in inline_keyboard:
-        for button in row:
-            if button.callback_data == query.data:
-                selected_city_name = button.text
-                break
-    context.user_data["calc_city_id"] = city_id
-    context.user_data["calc_city_name"] = selected_city_name
-    storage_name = context.user_data.get("calc_storage_name", "")
+    if not parcels:
+        await query.answer("Нет посылок для удаления.", show_alert=True)
+        return
     keyboard = [
         [
             InlineKeyboardButton(
-                "🔙 Назад к стране", callback_data="calc_back_to_country"
+                f"❌ {parcel.nickname or parcel.tracking_number}",
+                callback_data=f"del_{parcel.tracking_number}",
             )
-        ],
-        [InlineKeyboardButton("❌ Отмена", callback_data="calc_cancel")],
+        ]
+        for parcel in parcels
     ]
-    await safe_edit_message(
-        query,
-        f"📦 Склад: {storage_name}\n🏙️ Город: {selected_city_name}\n\n⚖️ Введите вес посылки в килограммах (например: 2.5):",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    keyboard.extend(
+        [
+            [InlineKeyboardButton("🔥🔥🔥 Удалить ВСЕ", callback_data="del_all")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_parcels")],
+        ]
     )
-    return CALC_WEIGHT
-
-
-@handle_errors()
-async def calculator_weight_received(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
     try:
-        weight_text = update.message.text.strip().replace(",", ".")
-        weight = float(weight_text)
-        if weight <= 0 or weight > 31.5:
-            await safe_send_message(
-                update,
-                "❌ Вес должен быть от 0.01 до 31.5 кг.\n\nВведите число, например: 2.5",
-            )
-            return CALC_WEIGHT
-    except ValueError:
-        await safe_send_message(
-            update, "❌ Неверный формат веса.\n\nВведите число, например: 2.5"
+        await safe_edit_message(
+            query,
+            "Выберите трек-номер для удаления:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
-        return CALC_WEIGHT
-    context.user_data["calc_weight"] = weight
-    storage_name = context.user_data.get("calc_storage_name", "")
-    city_name = context.user_data.get("calc_city_name", "")
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🚚 Курьерская доставка", callback_data="calc_delivery_courier"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📍 Доставка в пункт выдачи", callback_data="calc_delivery_pickup"
-            )
-        ],
-        [InlineKeyboardButton("❌ Отмена", callback_data="calc_cancel")],
-    ]
-    await safe_send_message(
-        update,
-        f"📦 Склад: {storage_name}\n🏙️ Город: {city_name}\n⚖️ Вес: {weight} кг\n\nВыберите способ доставки:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return CALC_DELIVERY
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            pass
+        else:
+            raise
 
 
 @handle_errors()
-async def calculator_delivery_selected(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+@async_db_session()
+async def button_handler(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
     await query.answer()
-    delivery_type = query.data.replace("calc_delivery_", "")
-    courier = delivery_type == "courier"
-    storage_id = context.user_data.get("calc_storage_id")
-    city_id = context.user_data.get("calc_city_id")
-    weight = context.user_data.get("calc_weight")
-    await safe_edit_message(query, "⏳ Расчет стоимости...")
-    cost = await BoxberryAPI.calculate_delivery_cost(
-        storage_id, city_id, weight, courier
-    )
-    storage_name = context.user_data.get("calc_storage_name", "")
-    city_name = context.user_data.get("calc_city_name", "")
-    delivery_text = "Курьерская доставка" if courier else "Доставка в пункт выдачи"
-    result_text = (
-        f"💰 **Результат расчета**\n\n"
-        f"📦 Склад: {storage_name}\n"
-        f"🏙️ Город: {city_name}\n"
-        f"⚖️ Вес: {weight} кг\n"
-        f"🚚 Способ доставки: {delivery_text}\n\n"
-    )
-    if cost:
-        result_text += f"💵 **Стоимость: {cost} ₽**"
-        keyboard = [
-            [InlineKeyboardButton("🔄 Новый расчет", callback_data="calc_new")],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="main_menu")],
-        ]
-    else:
-        result_text += (
-            f"❌ **Ошибка расчета**\n\n"
-            f"Не удалось рассчитать стоимость доставки.\n"
-            f"Попробуйте позже или обратитесь к администратору."
+    data = query.data
+    if data == "main_menu":
+        await query.message.reply_text(
+            "Главное меню:", reply_markup=get_main_menu_keyboard()
         )
-        keyboard = [
-            [InlineKeyboardButton("🔄 Попробовать снова", callback_data="calc_new")]
-        ]
-    await safe_edit_message(
-        query, result_text, reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
+        return
+    elif data == "register":
+        return await register_cmd(update, context)
+    elif data == "login":
+        return await login_cmd(update, context)
+    elif data == "bxbox_rules":
+        await bxbox_rules_cmd(update, context)
+    elif data == "refresh_parcels":
+        user = await session.get(User, query.from_user.id)
+        text, markup = await get_my_parcels_content(session, user)
+        try:
+            await safe_edit_message(
+                query, text, reply_markup=markup, parse_mode="Markdown"
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                raise
+    elif data.startswith("calc_"):
+        if data.startswith("calc_storage_"):
+            return await calculator_storage_selected(update, context)
+        elif data.startswith("calc_city_"):
+            return await calculator_city_selected(update, context)
+        elif data == "calc_city_new_search":
+            return await calculator_city_new_search(update, context)
+        elif data == "calc_back_to_country":
+            return await calc_back_to_country(update, context)
+        elif data == "calc_new":
+            return await calculator_start(update, context)
+        elif data == "calc_cancel":
+            return await calculator_cancel(update, context)
+        elif data.startswith("calc_delivery_"):
+            return await calculator_delivery_selected(update, context)
+    elif data == "add_new_tracking":
+        return await add_tracking_start(update, context)
+    elif data.startswith("track_"):
+        tracking_id = data.split("_", 1)[1]
+        await send_tracking_info(update, context, tracking_id)
+    elif data == "start_delete":
+        await start_delete_menu(update, context)
+    elif data.startswith("del_"):
+        user = await session.get(User, query.from_user.id)
+        if not user or not user.username:
+            await query.answer(
+                "❌ Для удаления посылок необходимо войти в аккаунт.", show_alert=True
+            )
+            return
+        if data == "del_all":
+            await session.execute(
+                Parcel.__table__.delete().where(Parcel.user_id == user.telegram_id)
+            )
+            await session.commit()
+            await query.answer("✅ Все посылки удалены.", show_alert=True)
+            text, markup = await get_my_parcels_content(session, user)
+            try:
+                await safe_edit_message(
+                    query, text, reply_markup=markup, parse_mode="Markdown"
+                )
+            except Exception as e:
+                if "Message is not modified" in str(e):
+                    pass
+                else:
+                    raise
+        else:
+            tracking = data[4:]
+            await session.execute(
+                Parcel.__table__.delete().where(
+                    and_(
+                        Parcel.user_id == user.telegram_id,
+                        Parcel.tracking_number == tracking,
+                    )
+                )
+            )
+            await session.commit()
+            await query.answer(f"✅ Трек-номер {tracking} удален.", show_alert=True)
+            text, markup = await get_my_parcels_content(session, user)
+            try:
+                await safe_edit_message(
+                    query, text, reply_markup=markup, parse_mode="Markdown"
+                )
+            except Exception as e:
+                if "Message is not modified" in str(e):
+                    pass
+                else:
+                    raise
+    elif data == "back_to_parcels":
+        user = await session.get(User, query.from_user.id)
+        text, markup = await get_my_parcels_content(session, user)
+        try:
+            await safe_edit_message(
+                query, text, reply_markup=markup, parse_mode="Markdown"
+            )
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                raise
+    elif data.startswith("rule_"):
+        await bxbox_rules_country_selected(update, context)
+    elif data == "back_to_rules":
+        await back_to_rules(update, context)
+    else:
+        await safe_edit_message(query, "Неизвестное действие.")
 
 
 @handle_errors()
-async def calculator_city_new_search(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+@async_db_session()
+async def handle_menu_selection(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    query = update.callback_query
-    await query.answer()
-    storage_name = context.user_data.get("calc_storage_name", "")
-    await safe_edit_message(
-        query,
-        f"📦 Склад: {storage_name}\n\n🏙️ Введите название города получателя (например: Москва):",
-    )
-    return CALC_CITY_SEARCH
-
-
-@handle_errors()
-async def calculator_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    if update.callback_query:
-        await safe_edit_message(update.callback_query, "❌ Расчет отменен.")
-    else:
-        await safe_send_message(
-            update, "❌ Расчет отменен.", reply_markup=get_main_menu_keyboard()
-        )
-    return ConversationHandler.END
-
-
-@handle_errors()
-async def calc_back_to_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    keys_to_keep = []
-    user_data_copy = {k: v for k, v in context.user_data.items() if k in keys_to_keep}
-    context.user_data.clear()
-    context.user_data.update(user_data_copy)
-    await calculator_start(update, context)
-    return CALC_STORAGE
-
-
-@handle_errors()
-async def handle_menu_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-
-    # Очистка активных разговоров
     context.user_data.clear()
-
-    if text == "📦 Мои посылки":
+    if text == "📦 Мои посылки" or text == "📋 Мои посылки":
         await my_parcels_cmd(update, context)
     elif text == "💰 Калькулятор":
         await calculator_start(update, context)
     elif text == "📋 BxBox Правила":
         await bxbox_rules_cmd(update, context)
+    elif text == "🌍 Россия → СНГ , Международные → Россия":
+        boxberry_cis_text = (
+            "🌍 Доставка в страны СНГ через Boxberry\n"
+            "Куда вы хотите отправить посылку? Boxberry доставляет в Казахстан, Беларусь, Армению, Кыргызстан, Таджикистан и Узбекистан.\n"
+            "Краткая информация: Boxberry — доставка из России в Россию (более 640 городов) и страны СНГ (Казахстан, Беларусь, Армения, Кыргызстан, Таджикистан, Узбекистан)."
+        )
+        await safe_send_message(
+            update,
+            boxberry_cis_text,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Источник",
+                            url="https://boxberry.ru/faq/chastnym-klientam-voprosy-i-otvety/posylki-chastnym-licam",
+                        )
+                    ]
+                ]
+            ),
+        )
+        bxbox_text = (
+            "🌍 Доставка в Россию из стран мира через Bxbox\n"
+            "Bxbox доставляет из США, Китая, Германии, Испании, Индии в Россию.\n"
+            "Краткая информация: Bxbox — международная доставка в Россию из США, Китая, Германии, Испании, Индии (как часть ЕС и других партнеров)."
+        )
+        await safe_send_message(
+            update,
+            bxbox_text,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Расчет стоимости доставки",
+                            url="https://bxbox.boxberry.ru/#import-calculator",
+                        )
+                    ]
+                ]
+            ),
+        )
     elif text == "🎫 Создать тикет":
-        await create_ticket_cmd(update, context)
+        boxberry_ticket_text = "Boxberry — доставка из России в Россию (более 640 городов) и страны СНГ (Казахстан, Беларусь, Армения, Кыргызстан, Таджикистан, Узбекистан)."
+        await safe_send_message(
+            update,
+            boxberry_ticket_text,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Контакты Boxberry", url="https://boxberry.ru/kontakty"
+                        )
+                    ]
+                ]
+            ),
+        )
+        bxbox_ticket_text = "Bxbox — международная доставка в Россию из США, Китая, Германии, Испании, Индии (как часть ЕС и других партнеров)."
+        await safe_send_message(
+            update,
+            bxbox_ticket_text,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Создать тикет Bxbox",
+                            url="https://bxbox.bxb.delivery/ru/new-ticket/1",
+                        )
+                    ]
+                ]
+            ),
+        )
     elif text == "❓ Помощь":
         await help_cmd(update, context)
     elif text == "👤 Профиль":
@@ -1267,20 +1682,6 @@ async def handle_menu_selection(update: Update, context: ContextTypes.DEFAULT_TY
         )
     elif text == "🔑 Изменить пароль":
         await change_password_start(update, context)
-    elif text == "🌍 СНГ страны":
-        text_response = data_manager.keywords.get("куда отправить", {}).get(
-            "text", "Информация о доставке в страны СНГ доступна на нашем сайте."
-        )
-        link = data_manager.keywords.get("международная доставка", {}).get(
-            "link", "https://boxberry.ru"
-        )
-        await safe_send_message(
-            update,
-            f"🌍 Доставка в страны СНГ\n\n{text_response}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Подробнее о международной доставке", url=link)]]
-            ),
-        )
     elif text == "📍 Изменить адрес":
         await safe_send_message(
             update,
@@ -1297,47 +1698,30 @@ async def handle_menu_selection(update: Update, context: ContextTypes.DEFAULT_TY
             ),
         )
     else:
-        await keyword_handler(update, context)
+        await keyword_handler(session, update, context)
 
 
 @handle_errors()
-@async_db_session
-async def keyword_handler(session, update: Update, context: ContextTypes.DEFAULT_TYPE):
+@async_db_session()
+async def keyword_handler(
+    session: AsyncSession, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     user_input = update.message.text.strip()
-    menu_options = [
-        "📦 Мои посылки",
-        "💰 Калькулятор",
-        "📋 BxBox Правила",
-        "🌍 СНГ страны",
-        "🎫 Создать тикет",
-        "❓ Помощь",
-        "👤 Профиль",
-        "🏠 Главное меню",
-        "🔑 Изменить пароль",
-        "📍 Изменить адрес",
-    ]
-    if user_input in menu_options:
-        await safe_send_message(
-            update,
-            "🤔 Пожалуйста, выберите действие из меню.",
-            reply_markup=get_main_menu_keyboard(),
-        )
-        return
     if TRACKING_PATTERN.match(user_input.upper()):
         tracking_number = user_input.upper()
-        user = (
-            session.query(User).filter_by(telegram_id=update.effective_user.id).first()
-        )
+        user = await session.get(User, update.effective_user.id)
         additional_text = ""
         if user and user.username:
             exists = (
-                session.query(Parcel)
-                .filter_by(user_id=user.id, tracking_number=tracking_number)
-                .first()
-            )
+                await session.execute(
+                    select(Parcel).filter_by(
+                        user_id=user.telegram_id, tracking_number=tracking_number
+                    )
+                )
+            ).scalar_one_or_none()
             if not exists:
                 parcel = Parcel(
-                    user_id=user.id,
+                    user_id=user.telegram_id,
                     tracking_number=tracking_number,
                     last_status="Добавлено",
                 )
@@ -1351,283 +1735,197 @@ async def keyword_handler(session, update: Update, context: ContextTypes.DEFAULT
             )
         await send_tracking_info(update, context, tracking_number, additional_text)
         return
-    normalized_input = normalize_text(user_input)
     choices = {
-        normalize_text(f"{key} {' '.join(data.get('keywords', []))}"): key
+        f"{key} {' '.join(data.get('keywords', []))}": key
         for key, data in data_manager.keywords.items()
     }
-    results = process.extract(
-        normalized_input, choices.keys(), limit=3, scorer=fuzz.token_set_ratio
+    best_match = process.extractOne(user_input, choices.keys())
+    if best_match and best_match[1] > 80:
+        selected_key = choices[best_match[0]]
+        text = data_manager.keywords.get(selected_key, {}).get(
+            "text", "Информация не найдена."
+        )
+        link = data_manager.keywords.get(selected_key, {}).get("link", config.BASE_URL)
+        keyboard = [[InlineKeyboardButton("Подробнее", url=link)]]
+        await safe_send_message(
+            update, text, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await safe_send_message(
+            update, "ℹ️ Информация не найдена. Попробуйте другой запрос."
+        )
+
+
+@handle_errors()
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "❓ **Помощь**\n\n"
+        "**Основные команды:**\n"
+        "/start - Главное меню\n"
+        "/help - Эта справка\n"
+        "/profile - Просмотр профиля\n"
+        "/myparcels - Список ваших посылок\n"
+        "/calculator - Калькулятор доставки\n"
+        "/register - Регистрация\n"
+        "/login - Вход в аккаунт\n\n"
+        "**Дополнительно:**\n"
+        "• Введите трек-номер для быстрого отслеживания\n"
+        "• Используйте ключевые слова для поиска информации\n"
+        "• Без регистрации доступны все функции, кроме сохранения посылок"
     )
-    if results:
-        best_match, best_score = results[0]
-        if best_score > 70:
-            key = choices[best_match]
-            meta = data_manager.keywords[key]
-            text = meta.get("text", "Информация не найдена.")
-            keyboard = (
-                [[InlineKeyboardButton("🔗 Подробнее на сайте", url=meta.get("link"))]]
-                if meta.get("link")
-                else None
-            )
-            await safe_send_message(
-                update,
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-            )
-        else:
-            keyboard = [
+    await safe_send_message(
+        update, text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown"
+    )
+
+
+@handle_errors()
+async def create_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    boxberry_ticket_text = "Boxberry — доставка из России в Россию (более 640 городов) и страны СНГ (Казахстан, Беларусь, Армения, Кыргызстан, Таджикистан, Узбекистан)."
+    await safe_send_message(
+        update,
+        boxberry_ticket_text,
+        reply_markup=InlineKeyboardMarkup(
+            [
                 [
                     InlineKeyboardButton(
-                        f"❓ {choices[match].capitalize()}",
-                        callback_data=f"kw_{choices[match]}",
+                        "Контакты Boxberry", url="https://boxberry.ru/kontakty"
                     )
                 ]
-                for match, score in results
-                if score > 45
             ]
-            if keyboard:
-                await safe_send_message(
-                    update,
-                    "🤔 Я не совсем уверен, что вы имеете в виду. Возможно, вас интересует:",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                )
-            else:
-                await safe_send_message(
-                    update,
-                    "К сожалению, я не смог распознать ваш запрос. Пожалуйста, попробуйте переформулировать его или воспользуйтесь главным меню.",
-                    reply_markup=get_main_menu_keyboard(),
-                )
-
-
-@handle_errors()
-async def keyword_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    key = query.data.split("_", 1)[1]
-    if key in data_manager.keywords:
-        meta = data_manager.keywords[key]
-        text = meta.get("text", "Информация не найдена.")
-        keyboard = (
-            [[InlineKeyboardButton("🔗 Подробнее на сайте", url=meta.get("link"))]]
-            if meta.get("link")
-            else None
-        )
-        await safe_edit_message(
-            query,
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-        )
-
-
-@handle_errors()
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    # Очистка состояния разговора для всех кнопок, кроме register и login
-    if data not in ["register", "login"]:
-        conv_keys = [
-            k
-            for k in context.user_data.keys()
-            if k.startswith(("reg_", "login_", "calc_"))
-        ]
-        for key in conv_keys:
-            context.user_data.pop(key, None)
-
-    if data == "register":
-        return await register_cmd(update, context)
-    elif data == "login":
-        return await login_cmd(update, context)
-    elif data == "help_guest":
-        await help_cmd(update, context)
-    elif data == "add_new_tracking":
-        prompt_msg = await query.message.reply_text(
-            "Введите трек-номер для добавления:"
-        )
-        context.user_data["add_prompt_id"] = prompt_msg.message_id
-        return ADD_TRACKING
-    elif data.startswith("track_"):
-        tracking_id = data.split("_", 1)[1]
-        await send_tracking_info(update, context, tracking_id)
-    elif data == "start_delete":
-        await start_delete_menu(update, context)
-    elif data == "back_to_parcels":
-        session = SessionLocal()
-        try:
-            user = db_get_or_create_user(session, query.from_user.id)
-            text, markup = await get_my_parcels_content(session, user)
-            await safe_edit_message(query, text, reply_markup=markup)
-            session.commit()
-        finally:
-            session.close()
-    elif data.startswith("del_"):
-        if data == "del_all":
-            await handle_delete(update, context, all=True)
-        else:
-            tracking_id = data.split("_", 1)[1]
-            await handle_delete(update, context, tracking=tracking_id)
-    elif data == "main_menu":
-        await safe_edit_message(query, "Главное меню:")
-        await query.message.reply_text(
-            "Выберите действие:", reply_markup=get_main_menu_keyboard()
-        )
-    elif data == "refresh_parcels":
-        session = SessionLocal()
-        try:
-            user = db_get_or_create_user(session, query.from_user.id)
-            text, markup = await get_my_parcels_content(session, user)
-            await safe_edit_message(query, text, reply_markup=markup)
-            session.commit()
-        finally:
-            session.close()
-    elif data.startswith("calc_"):
-        if data.startswith("calc_storage_"):
-            return await calculator_storage_selected(update, context)
-        elif data.startswith("calc_city_"):
-            return await calculator_city_selected(update, context)
-        elif data == "calc_city_new_search":
-            return await calculator_city_new_search(update, context)
-        elif data == "calc_back_to_country":
-            return await calc_back_to_country(update, context)
-        elif data == "calc_new":
-            return await calculator_start(update, context)
-        elif data == "calc_cancel":
-            return await calculator_cancel(update, context)
-        elif data.startswith("calc_delivery_"):
-            return await calculator_delivery_selected(update, context)
-
-
-async def send_tracking_info(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    tracking_number: str,
-    additional_text: str = "",
-):
-    tracking_url = f"{config.BASE_URL}/tracking-page?id={tracking_number}"
-    keyboard = [[InlineKeyboardButton("🔍 Отследить на сайте", url=tracking_url)]]
-    message_text = f"📦 Трек-номер: `{tracking_number}` {additional_text}"
-    if "last_tracking_message_id" in context.user_data:
-        try:
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=context.user_data["last_tracking_message_id"],
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось удалить сообщение: {e}")
-    try:
-        msg = await (update.message or update.callback_query.message).reply_text(
-            message_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
-        context.user_data["last_tracking_message_id"] = msg.message_id
-    except Exception as e:
-        logger.error(f"Не удалось отправить информацию о треке: {e}")
-
-
-def db_get_or_create_user(
-    session, telegram_id: int, username: Optional[str] = None
-) -> User:
-    user = session.query(User).filter_by(telegram_id=telegram_id).first()
-    if user:
-        if username and user.username != username:
-            user.username = username
-        return user
-    user = User(telegram_id=telegram_id, username=username)
-    session.add(user)
-    return user
-
-
-@handle_errors()
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send_message(
-        update, "Действие отменено.", reply_markup=get_main_menu_keyboard()
+        ),
     )
-    context.user_data.clear()
-    return ConversationHandler.END
+    bxbox_ticket_text = "Bxbox — международная доставка в Россию из США, Китая, Германии, Испании, Индии (как часть ЕС и других партнеров)."
+    await safe_send_message(
+        update,
+        bxbox_ticket_text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Создать тикет Bxbox",
+                        url="https://bxbox.bxb.delivery/ru/new-ticket/1",
+                    )
+                ]
+            ]
+        ),
+    )
 
 
 async def cleanup():
     await HTTPManager.close()
+    await CacheManager.close()
 
 
-def main():
-    init_db()
+async def main():
+    await init_db()
     if not config.TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения")
-
+        raise ValueError("TELEGRAM_TOKEN not found in environment variables")
     app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).build()
+    await CacheManager.init()
+    menu_regex = filters.Regex(
+        r"^(📦 Мои посылки|💰 Калькулятор|📋 BxBox Правила|🌍 Россия → СНГ , Международные → Россия|📋 Мои посылки|🎫 Создать тикет|❓ Помощь|👤 Профиль|🏠 Главное меню|🔑 Изменить пароль|📍 Изменить адрес)$"
+    )
+
+    async def menu_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        return ConversationHandler.END
 
     reg_conv = ConversationHandler(
         entry_points=[
             CommandHandler("register", register_cmd),
-            CallbackQueryHandler(button_handler, pattern="^register$"),
+            CallbackQueryHandler(register_cmd, pattern="^register$"),
         ],
         states={
             REGISTER_LOGIN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, register_login_received)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    register_login_received,
+                )
             ],
             REGISTER_PASSWORD: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, register_password_received
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    register_password_received,
                 )
             ],
             REGISTER_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, register_name_received)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    register_name_received,
+                )
             ],
             REGISTER_SURNAME: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, register_surname_received
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    register_surname_received,
                 )
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(menu_regex, menu_cancel),
+            CommandHandler("start", start),
+            CommandHandler("help", help_cmd),
+            CommandHandler("profile", profile_cmd),
+            CommandHandler("myparcels", my_parcels_cmd),
+            CommandHandler("calculator", calculator_start),
+        ],
         per_user=True,
         per_chat=True,
     )
-
     login_conv = ConversationHandler(
         entry_points=[
             CommandHandler("login", login_cmd),
-            CallbackQueryHandler(button_handler, pattern="^login$"),
+            CallbackQueryHandler(login_cmd, pattern="^login$"),
         ],
         states={
             LOGIN_LOGIN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_login_received)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex, login_login_received
+                )
             ],
             LOGIN_PASSWORD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_password_received)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    login_password_received,
+                )
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(menu_regex, menu_cancel),
+            CommandHandler("start", start),
+            CommandHandler("help", help_cmd),
+            CommandHandler("profile", profile_cmd),
+            CommandHandler("myparcels", my_parcels_cmd),
+            CommandHandler("calculator", calculator_start),
+        ],
         per_user=True,
         per_chat=True,
     )
-
     add_tracking_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(button_handler, pattern="^add_new_tracking$")
+            CallbackQueryHandler(add_tracking_start, pattern="^add_new_tracking$")
         ],
         states={
             ADD_TRACKING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_tracking_received)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex, add_tracking_received
+                )
             ]
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            MessageHandler(
-                filters.Regex(
-                    r"^(📦 Мои посылки|💰 Калькулятор|📋 BxBox Правила|🌍 СНГ страны|🎫 Создать тикет|❓ Помощь|👤 Профиль|🏠 Главное меню)$"
-                ),
-                cancel,
-            ),
+            MessageHandler(menu_regex, menu_cancel),
+            CommandHandler("start", start),
+            CommandHandler("help", help_cmd),
+            CommandHandler("profile", profile_cmd),
+            CommandHandler("myparcels", my_parcels_cmd),
+            CommandHandler("calculator", calculator_start),
         ],
         per_user=True,
         per_chat=True,
     )
-
     change_password_conv = ConversationHandler(
         entry_points=[
             MessageHandler(
@@ -1637,20 +1935,29 @@ def main():
         states={
             CHANGE_OLD_PASSWORD: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, change_old_password_received
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    change_old_password_received,
                 )
             ],
             CHANGE_NEW_PASSWORD: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, change_new_password_received
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    change_new_password_received,
                 )
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(menu_regex, menu_cancel),
+            CommandHandler("start", start),
+            CommandHandler("help", help_cmd),
+            CommandHandler("profile", profile_cmd),
+            CommandHandler("myparcels", my_parcels_cmd),
+            CommandHandler("calculator", calculator_start),
+        ],
         per_user=True,
         per_chat=True,
     )
-
     calc_conv = ConversationHandler(
         entry_points=[
             CommandHandler("calculator", calculator_start),
@@ -1665,7 +1972,8 @@ def main():
             ],
             CALC_CITY_SEARCH: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, calculator_city_search_received
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    calculator_city_search_received,
                 )
             ],
             CALC_CITY_SELECT: [
@@ -1679,7 +1987,8 @@ def main():
             ],
             CALC_WEIGHT: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, calculator_weight_received
+                    filters.TEXT & ~filters.COMMAND & ~menu_regex,
+                    calculator_weight_received,
                 )
             ],
             CALC_DELIVERY: [
@@ -1690,46 +1999,60 @@ def main():
         },
         fallbacks=[
             CallbackQueryHandler(calculator_cancel, pattern="^calc_cancel$"),
-            CommandHandler("cancel", calculator_cancel),
+            CommandHandler("cancel", cancel),
+            MessageHandler(menu_regex, menu_cancel),
+            CommandHandler("start", start),
+            CommandHandler("help", help_cmd),
+            CommandHandler("profile", profile_cmd),
+            CommandHandler("myparcels", my_parcels_cmd),
         ],
         per_user=True,
         per_chat=True,
     )
-
-    # Сначала добавляем ConversationHandlers
     app.add_handler(reg_conv)
     app.add_handler(login_conv)
     app.add_handler(add_tracking_conv)
     app.add_handler(change_password_conv)
     app.add_handler(calc_conv)
-
-    # Затем команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("profile", profile_cmd))
     app.add_handler(CommandHandler("myparcels", my_parcels_cmd))
-
-    # Callback handlers
     app.add_handler(CallbackQueryHandler(keyword_callback_handler, pattern=r"^kw_"))
     app.add_handler(
         CallbackQueryHandler(bxbox_rules_country_selected, pattern="^rule_")
     )
     app.add_handler(CallbackQueryHandler(back_to_rules, pattern="^back_to_rules$"))
     app.add_handler(CallbackQueryHandler(button_handler))
-
-    # В конце - общий обработчик текста
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_selection)
     )
-
-    logger.info("Boxberry Bot успешно запущен")
-    print("Boxberry Bot запущен.")
-
+    logger.info("Boxberry Bot successfully started")
+    print("Boxberry Bot started.")
     try:
-        app.run_polling()
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        pass
     finally:
-        asyncio.run(cleanup())
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    loop = asyncio.get_event_loop()
+    try:
+        if loop.is_running():
+            loop.create_task(main())
+        else:
+            loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        if not loop.is_closed():
+            loop.close()
